@@ -243,9 +243,12 @@ __global__ void flash_attn_kernel(
   float m = -INFINITY;   // running max of scores for this row
   float l = 0.0f;        // running softmax denominator for this row
 
+  // Causal pruning: no source beyond the largest diagonal in this block
+  // (t0+BR-1) can be attended, so skip those tiles entirely.
+  const int s_limit = is_causal ? min(src_seq, t0 + BR) : src_seq;
   const bool use_vec = (H % kVecW<T>() == 0);
 
-  for (int s0 = 0; s0 < src_seq; s0 += BC) {
+  for (int s0 = 0; s0 < s_limit; s0 += BC) {
     // ---------- stage K/V tile for source range [s0, s0+BC) ----------
     const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
