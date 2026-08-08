@@ -24,6 +24,11 @@ template <> struct CudaTypeTraits<half> {
   static __device__ __forceinline__ half from_float(float x) { return __float2half(x); }
 };
 
+// Vector width (in elements) of a 16-byte aligned load for type T.
+template <typename T> __host__ __device__ constexpr int kVecW();
+template <> __host__ __device__ constexpr int kVecW<float>() { return 4; }
+template <> __host__ __device__ constexpr int kVecW<half>()  { return 8; }
+
 // ---------------------------------------------------------------------------
 // Warp reduction helpers (result broadcast to every lane via shuffle).
 // ---------------------------------------------------------------------------
@@ -80,16 +85,59 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* sdata) {
 }
 
 // ---------------------------------------------------------------------------
-// Staging of a [BC x head_dim] K/V tile into shared float (scalar path).
+// Staging of a [BC x head_dim] K/V tile into shared float.
 //
 // The tile rows (sources) live in global memory strided by `kv_heads*head_dim`
 // elements (row-major [batch, src, kv_heads, head_dim] layout), so when
-// kv_heads > 1 (GQA) consecutive sources are NOT contiguous. The scalar path
-// honors that stride. Half is widened to float here so the hot dot/accum loops
-// never re-convert.
+// kv_heads > 1 (GQA) consecutive sources are NOT contiguous. Both paths honor
+// that stride. Half is widened to float here so the hot dot/accum loops never
+// re-convert.
 //
-// Scalar, bounds-guarded staging: reads the first `rows_valid` source rows
-// (strided by kv_heads*head_dim), zero-fills the rest.
+// Vectorized path (`KVStageVec<T>::run`): requires a fully in-bounds tile
+// (rows_valid == BC) and a 16-byte aligned, vector-width-divisible head_dim
+// (checked by the caller). Loads via float4 (fp32) / uint4 (fp16, 8 halves)
+// from global, then writes widened fp32 into the shared tile.
+// ---------------------------------------------------------------------------
+template <typename T> struct KVStageVec;
+
+template <> struct KVStageVec<float> {
+  __device__ __forceinline__ static void run(const float* __restrict__ g,
+                                             float* __restrict__ s, int head_dim,
+                                             int hs, int bc, int kv_heads,
+                                             int tid, int nthreads) {
+    const int chunks = head_dim >> 2;               // float4 per source row
+    const int vec_stride = kv_heads * chunks;       // float4 stride between rows
+    const float4* g4 = reinterpret_cast<const float4*>(g);
+    for (int idx = tid; idx < bc * chunks; idx += nthreads) {
+      const int c = idx / chunks, ch = idx - c * chunks;
+      const float4 x = __ldg(g4 + c * vec_stride + ch);
+      const int base = c * hs + ch * 4;
+      s[base] = x.x; s[base + 1] = x.y; s[base + 2] = x.z; s[base + 3] = x.w;
+    }
+  }
+};
+template <> struct KVStageVec<half> {
+  __device__ __forceinline__ static void run(const half* __restrict__ g,
+                                             float* __restrict__ s, int head_dim,
+                                             int hs, int bc, int kv_heads,
+                                             int tid, int nthreads) {
+    const int chunks = head_dim >> 3;               // uint4 (8 halves) per row
+    const int vec_stride = kv_heads * chunks;
+    const uint4* g4 = reinterpret_cast<const uint4*>(g);
+    for (int idx = tid; idx < bc * chunks; idx += nthreads) {
+      const int c = idx / chunks, ch = idx - c * chunks;
+      const uint4 u = __ldg(g4 + c * vec_stride + ch);
+      const half* hp = reinterpret_cast<const half*>(&u);
+      const int base = c * hs + ch * 8;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        s[base + e] = __half2float(hp[e]);
+    }
+  }
+};
+
+// Scalar, bounds-guarded fallback (partial / misaligned tile): reads the first
+// `rows_valid` source rows (strided by kv_heads*head_dim), zero-fills the rest.
 template <typename T>
 __device__ __forceinline__ void stage_scalar(const T* __restrict__ g,
                                              float* __restrict__ s, int head_dim,
@@ -195,13 +243,21 @@ __global__ void flash_attn_kernel(
   float m = -INFINITY;   // running max of scores for this row
   float l = 0.0f;        // running softmax denominator for this row
 
+  const bool use_vec = (H % kVecW<T>() == 0);
+
   for (int s0 = 0; s0 < src_seq; s0 += BC) {
     // ---------- stage K/V tile for source range [s0, s0+BC) ----------
     const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+    const bool full = (s0 + BC <= src_seq);
     const int rows_valid = min(BC, src_seq - s0);
-    stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
-    stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    if (full && use_vec) {
+      KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
+      KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
+    } else {
+      stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+      stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    }
     __syncthreads();                       // K/V tile ready for all warps
 
     if (row_valid) {
