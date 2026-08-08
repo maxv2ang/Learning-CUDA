@@ -96,7 +96,12 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* sdata) {
 // Vectorized path (`KVStageVec<T>::run`): requires a fully in-bounds tile
 // (rows_valid == BC) and a 16-byte aligned, vector-width-divisible head_dim
 // (checked by the caller). Loads via float4 (fp32) / uint4 (fp16, 8 halves)
-// from global, then writes widened fp32 into the shared tile.
+// from global, then writes widened fp32 into the PADDED shared tile.
+//
+// PADDING (`hs = head_dim+1`): the shared K/V rows are stored with stride hs
+// instead of head_dim so that lanes reading their own row at a common column
+// (dot phase) hit distinct banks (see kernel). This removes the 32-way shared
+// bank conflict when head_dim is a multiple of 32.
 // ---------------------------------------------------------------------------
 template <typename T> struct KVStageVec;
 
@@ -212,7 +217,7 @@ __global__ void flash_attn_kernel(
   const int t0  = blockIdx.x * BR;      // first target row of this block
   const int t   = t0 + warp;            // this warp's query row
   const int H   = head_dim;
-  const int HS  = H;                       // shared row stride
+  const int HS  = H + 1;                // padded shared row stride (bank-conflict free)
   const bool row_valid = (t < tgt_seq); // this query row exists
 
   // GQA: query head qh reads KV head (qh / repeat), matching PyTorch's
@@ -222,8 +227,8 @@ __global__ void flash_attn_kernel(
 
   extern __shared__ float smem[];
   float* s_q   = smem;                    // [BR*H]     staged query tile
-  float* s_k   = s_q + BR * H;            // [BC*HS]    staged key tile
-  float* s_v   = s_k + BC * HS;           // [BC*HS]    staged value tile
+  float* s_k   = s_q + BR * H;            // [BC*HS]    padded staged key tile
+  float* s_v   = s_k + BC * HS;           // [BC*HS]    padded staged value tile
   float* s_p   = s_v + BC * HS;           // [BR*BC]    softmax probs per (row,source)
   float* s_acc = s_p + BR * BC;           // [BR*H]     online-softmax weighted sums
 
@@ -243,7 +248,7 @@ __global__ void flash_attn_kernel(
   float m = -INFINITY;   // running max of scores for this row
   float l = 0.0f;        // running softmax denominator for this row
 
-  // Causal pruning: no source beyond the largest diagonal in this block
+  // Causal pruning (C): no source beyond the largest diagonal in this block
   // (t0+BR-1) can be attended, so skip those tiles entirely.
   const int s_limit = is_causal ? min(src_seq, t0 + BR) : src_seq;
   const bool use_vec = (H % kVecW<T>() == 0);
@@ -273,6 +278,7 @@ __global__ void flash_attn_kernel(
         const float* qrow = s_q + warp * H;
         const float* krow = s_k + lane * HS;
         float acc = 0.0f;
+#pragma unroll 4
         for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];
         dot = acc * scale;
       }
@@ -361,11 +367,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(musaMemcpy(d_v, h_v.data(), kn * sizeof(T), musaMemcpyHostToDevice));
 
   constexpr int BR = 8, BC = 32;
-  const int HS = head_dim;       // shared row stride
+  const int HS = head_dim + 1;   // padded shared row stride
   const float scale = 1.0f / sqrtf((float)head_dim);   // SDPA default scaling
   const dim3 grid((target_seq_len + BR - 1) / BR, batch_size, query_heads);
   const size_t smem = ((size_t)BR * head_dim      // s_q
-                       + 2 * (size_t)BC * HS       // s_k + s_v
+                       + 2 * (size_t)BC * HS       // s_k + s_v (padded)
                        + (size_t)BR * BC           // s_p
                        + (size_t)BR * head_dim)    // s_acc
                       * sizeof(float);
