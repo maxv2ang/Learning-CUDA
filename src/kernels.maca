@@ -2,6 +2,7 @@
 // MetaX MACA (mxcc) implementation.
 // MACA is CUDA-compatible, so the device kernels below are byte-identical to
 // kernels.cu; only the fp16 header and the host runtime (mc_*) differ.
+// All accumulation is done in fp32; fp16 is converted at the kernel boundary.
 // ============================================================================
 #include <vector>
 #include <cmath>
@@ -24,8 +25,19 @@ template <> struct CudaTypeTraits<half> {
 };
 
 // ---------------------------------------------------------------------------
-// Block reduction helpers (blockDim.x <= 1024)
+// Warp reduction helpers (result broadcast to every lane via shuffle).
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_max_bcast(float v) {
+  for (int off = 16; off > 0; off >>= 1)
+    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+  return __shfl_sync(0xffffffffu, v, 0);   // broadcast lane-0 result
+}
+__device__ __forceinline__ float warp_reduce_sum_bcast(float v) {
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, off);
+  return __shfl_sync(0xffffffffu, v, 0);
+}
+// Block reduction helpers (blockDim.x <= 1024), used by rmsNorm.
 __device__ __forceinline__ float warp_reduce_max(float v) {
   for (int off = 16; off > 0; off >>= 1)
     v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
@@ -67,6 +79,30 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* sdata) {
   return sdata[0];
 }
 
+// ---------------------------------------------------------------------------
+// Staging of a [BC x head_dim] K/V tile into shared float (scalar path).
+//
+// The tile rows (sources) live in global memory strided by `kv_heads*head_dim`
+// elements (row-major [batch, src, kv_heads, head_dim] layout), so when
+// kv_heads > 1 (GQA) consecutive sources are NOT contiguous. The scalar path
+// honors that stride. Half is widened to float here so the hot dot/accum loops
+// never re-convert.
+//
+// Scalar, bounds-guarded staging: reads the first `rows_valid` source rows
+// (strided by kv_heads*head_dim), zero-fills the rest.
+template <typename T>
+__device__ __forceinline__ void stage_scalar(const T* __restrict__ g,
+                                             float* __restrict__ s, int head_dim,
+                                             int hs, int bc, int rows_valid,
+                                             int kv_heads, int tid, int nthreads) {
+  for (int i = tid; i < bc * head_dim; i += nthreads) {
+    const int c = i / head_dim, d = i - c * head_dim;
+    s[c * hs + d] = (c < rows_valid)
+                        ? CudaTypeTraits<T>::to_float(g[(long long)c * kv_heads * head_dim + d])
+                        : 0.0f;
+  }
+}
+
 // ============================================================================
 // Problem 1 : RMSNorm
 // ============================================================================
@@ -96,21 +132,40 @@ __global__ void rmsnorm_kernel(const T* __restrict__ in,
 // ============================================================================
 // Problem 2 : Flash Attention / scaled dot product attention
 // ============================================================================
-// FlashAttention-1 style online softmax (see kernels.cu for a full comment).
-// Grid :  (target_seq_len, batch_size, query_heads); block = 128 threads,
-// one query row t per block; dot phase (thread = source) + accum phase
-// (thread = output dim), so each acc[d] is written by exactly one thread.
+// Tiled FlashAttention-1 (online softmax):
+//
+//   O[t, d] = sum_s  softmax_s(q_t . k_s * scale)  * V[s, d]
+//
+// * Each block handles BR query rows for a fixed (batch, query_head); the S
+//   dimension is streamed in tiles of BC source columns.
+// * K/V tiles are staged into shared memory once and reused by all BR rows
+//   (reduces global K/V traffic ~BRx). Q, K, V are widened to fp32 in shared.
+// * Grid : (ceil(target_seq_len/BR), batch_size, query_heads)
+// * Block: BR*BC threads = BR warps, one query row per warp. This keeps the
+//   softmax reduction warp-local (shuffle only, no __syncthreads in the S loop).
+// * Accumulation into acc[row][d] is done by the lane owning column d, so each
+//   shared slot is written by exactly one thread (no atomics).
+// * head_dim is supported up to ~128 (bounded by 48KB shared memory).
 template <typename T>
 __global__ void flash_attn_kernel(
     const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
     T* __restrict__ o, int tgt_seq, int src_seq, int q_heads, int kv_heads,
     int head_dim, float scale, bool is_causal) {
-  constexpr int THREADS = 128;          // == tile width in S
-  const int tid = threadIdx.x;
+  constexpr int BR = 8;                 // query rows per block
+  constexpr int BC = 32;                // source columns per tile (= warp size)
+  constexpr int THREADS = BR * BC;      // 256
 
-  const int b  = blockIdx.y;
-  const int qh = blockIdx.z;
-  const int t  = blockIdx.x;            // target (query) position
+  const int tid  = threadIdx.x;
+  const int warp = tid >> 5;            // 0..BR-1 -> query row within block
+  const int lane = tid & 31;            // 0..BC-1 -> source column within tile
+
+  const int b   = blockIdx.y;
+  const int qh  = blockIdx.z;
+  const int t0  = blockIdx.x * BR;      // first target row of this block
+  const int t   = t0 + warp;            // this warp's query row
+  const int H   = head_dim;
+  const int HS  = H;                       // shared row stride
+  const bool row_valid = (t < tgt_seq); // this query row exists
 
   // GQA: query head qh reads KV head (qh / repeat), matching PyTorch's
   // repeat_interleave semantics. Guard against a degenerate kv_heads == 0.
@@ -118,73 +173,88 @@ __global__ void flash_attn_kernel(
   const int kvh = (repeat > 0) ? (qh / repeat) : qh;
 
   extern __shared__ float smem[];
-  float* s_q   = smem;                            // head_dim  : staged query row
-  float* s_acc = smem + head_dim;                 // head_dim  : online-softmax weighted sum
-  float* s_p   = smem + 2 * head_dim;             // THREADS   : p_s per source in current tile
-  float* s_red = smem + 2 * head_dim + THREADS;   // 32        : reduction scratch
+  float* s_q   = smem;                    // [BR*H]     staged query tile
+  float* s_k   = s_q + BR * H;            // [BC*HS]    staged key tile
+  float* s_v   = s_k + BC * HS;           // [BC*HS]    staged value tile
+  float* s_p   = s_v + BC * HS;           // [BR*BC]    softmax probs per (row,source)
+  float* s_acc = s_p + BR * BC;           // [BR*H]     online-softmax weighted sums
 
-  const long long q_base   = ((long long)b * tgt_seq + t) * q_heads + qh;
-  const long long kv_base  = ((long long)b * src_seq) * kv_heads + kvh;
-
-  for (int d = tid; d < head_dim; d += THREADS)
-    s_q[d] = CudaTypeTraits<T>::to_float(q[q_base * head_dim + d]);
-  for (int d = tid; d < head_dim; d += THREADS)
-    s_acc[d] = 0.0f;
-  __syncthreads();
-
-  float m = -INFINITY;   // running max of scores (online softmax)
-  float l = 0.0f;        // running denominator  sum(exp(score - m))
-
-  for (int s0 = 0; s0 < src_seq; s0 += THREADS) {
-    const int s = s0 + tid;
-    const bool masked = (s >= src_seq) || (is_causal && s > t);
-
-    // ---- dot phase: this thread owns source s -----------------------------
-    float dot = -INFINITY;
-    if (!masked) {
-      const T* krow = k + (kv_base + (long long)s * kv_heads) * head_dim;
-      float acc_dot = 0.0f;
-      for (int d = 0; d < head_dim; d++)
-        acc_dot += s_q[d] * CudaTypeTraits<T>::to_float(krow[d]);
-      dot = acc_dot * scale;
+  // ---------- stage Q tile + zero the accumulators -------------------------
+  {
+    const int rows_valid_q = min(BR, tgt_seq - t0);
+    for (int i = tid; i < BR * H; i += THREADS) {
+      const int r = i / H, d = i - r * H;
+      s_q[i] = (r < rows_valid_q)
+                   ? CudaTypeTraits<T>::to_float(q[((long long)(b * tgt_seq + t0 + r) * q_heads + qh) * H + d])
+                   : 0.0f;
     }
-
-    const float m_tile = block_reduce_max(dot, s_red);
-    if (m_tile != -INFINITY) {           // skip fully-masked tiles
-      const float m_new = fmaxf(m, m_tile);
-      const float p = masked ? 0.0f : expf(dot - m_new);
-      const float l_tile = block_reduce_sum(p, s_red);
-      const float corr = expf(m - m_new);      // rescale old accumulator
-
-      s_p[tid] = p;
-      __syncthreads();                         // publish s_p[] before accum phase
-
-      // ---- accum phase: this thread owns output dim d ---------------------
-      for (int d = tid; d < head_dim; d += THREADS) {
-        float a = 0.0f;
-        for (int si = 0; si < THREADS; si++) {
-          const int src = s0 + si;
-          if (src < src_seq) {
-            const T* vrow = v + (kv_base + (long long)src * kv_heads) * head_dim;
-            a += s_p[si] * CudaTypeTraits<T>::to_float(vrow[d]);
-          }
-        }
-        s_acc[d] = s_acc[d] * corr + a;
-      }
-
-      m = m_new;
-      l = l * corr + l_tile;
-      __syncthreads();                         // s_acc[] ready before next tile
-    }
+    for (int i = tid; i < BR * H; i += THREADS) s_acc[i] = 0.0f;
+    __syncthreads();
   }
 
-  const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
-  for (int d = tid; d < head_dim; d += THREADS)
-    o[q_base * head_dim + d] = CudaTypeTraits<T>::from_float(s_acc[d] * inv_l);
+  float m = -INFINITY;   // running max of scores for this row
+  float l = 0.0f;        // running softmax denominator for this row
+
+  for (int s0 = 0; s0 < src_seq; s0 += BC) {
+    // ---------- stage K/V tile for source range [s0, s0+BC) ----------
+    const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+    const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+    const int rows_valid = min(BC, src_seq - s0);
+    stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    __syncthreads();                       // K/V tile ready for all warps
+
+    if (row_valid) {
+      const int j = s0 + lane;             // global source index
+      const bool masked = (j >= src_seq) || (is_causal && j > t);
+
+      // ---- dot phase: this lane owns source j ------------------------------
+      float dot = -INFINITY;
+      if (!masked) {
+        const float* qrow = s_q + warp * H;
+        const float* krow = s_k + lane * HS;
+        float acc = 0.0f;
+        for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];
+        dot = acc * scale;
+      }
+
+      // ---- online softmax, warp-local reduction ----------------------------
+      const float m_tile = warp_reduce_max_bcast(dot);
+      if (m_tile != -INFINITY) {           // skip fully-masked tiles
+        const float m_new = fmaxf(m, m_tile);
+        const float p = masked ? 0.0f : expf(dot - m_new);
+        const float l_tile = warp_reduce_sum_bcast(p);
+        const float corr = expf(m - m_new);   // rescale old accumulator
+
+        s_p[warp * BC + lane] = p;
+        __syncwarp();                        // publish p within this warp
+
+        // ---- accum phase: this lane owns output column d -------------------
+        for (int d = lane; d < H; d += BC) {
+          float a = 0.0f;
+          for (int si = 0; si < BC; si++)
+            a += s_p[warp * BC + si] * s_v[si * HS + d];
+          s_acc[warp * H + d] = s_acc[warp * H + d] * corr + a;
+        }
+
+        m = m_new;
+        l = l * corr + l_tile;
+      }
+    }
+    __syncthreads();                       // tile state free before next staging
+  }
+
+  // ---------- normalize and write the output row ----------------------------
+  if (row_valid) {
+    const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = lane; d < H; d += BC)
+      o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
+          CudaTypeTraits<T>::from_float(s_acc[warp * H + d] * inv_l);
+  }
 }
 
 // ============================================================================
-// Host wrappers (MetaX MACA runtime)
+// Host wrappers
 // ============================================================================
 template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
@@ -231,12 +301,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), kn * sizeof(T), mcMemcpyHostToDevice));
   RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), kn * sizeof(T), mcMemcpyHostToDevice));
 
+  constexpr int BR = 8, BC = 32;
+  const int HS = head_dim;       // shared row stride
   const float scale = 1.0f / sqrtf((float)head_dim);   // SDPA default scaling
-  constexpr int THREADS = 128;
-  const dim3 grid(target_seq_len, batch_size, query_heads);
-  const size_t smem = (2 * (size_t)head_dim + THREADS + 32) * sizeof(float);
+  const dim3 grid((target_seq_len + BR - 1) / BR, batch_size, query_heads);
+  const size_t smem = ((size_t)BR * head_dim      // s_q
+                       + 2 * (size_t)BC * HS       // s_k + s_v
+                       + (size_t)BR * BC           // s_p
+                       + (size_t)BR * head_dim)    // s_acc
+                      * sizeof(float);
 
-  flash_attn_kernel<T><<<grid, THREADS, smem>>>(
+  flash_attn_kernel<T><<<grid, BR * BC, smem>>>(
       d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads, kv_heads,
       head_dim, scale, is_causal);
   RUNTIME_CHECK(mcGetLastError());
