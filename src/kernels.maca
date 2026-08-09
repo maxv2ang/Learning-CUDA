@@ -203,7 +203,7 @@ template <typename T>
 __global__ void flash_attn_kernel(
     const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
     T* __restrict__ o, int tgt_seq, int src_seq, int q_heads, int kv_heads,
-    int head_dim, float scale, bool is_causal) {
+    int head_dim, bool is_causal) {
   constexpr int BR = 8;                 // query rows per block
   constexpr int BC = 32;                // source columns per tile (= warp size)
   constexpr int THREADS = BR * BC;      // 256
@@ -225,14 +225,24 @@ __global__ void flash_attn_kernel(
   const int repeat = (kv_heads > 0) ? (q_heads / kv_heads) : 1;
   const int kvh = (repeat > 0) ? (qh / repeat) : qh;
 
-  extern __shared__ float smem[];
-  float* s_q   = smem;                    // [BR*H]     staged query tile
-  float* s_k   = s_q + BR * H;            // [BC*HS]    padded staged key tile
-  float* s_v   = s_k + BC * HS;           // [BC*HS]    padded staged value tile
-  float* s_p   = s_v + BC * HS;           // [BR*BC]    softmax probs per (row,source)
-  float* s_acc = s_p + BR * BC;           // [BR*H]     online-softmax weighted sums
+  // SDPA scale, computed in fp32 on device (1.0f/sqrtf). Inputs are in [1,10)
+  // so dot products are large (~head_dim*25); a 1-ulp scale rounding would be
+  // amplified into a ~1e-5 output error under the tight tolerance.
+  const float scale = 1.0f / sqrtf((float)head_dim);
 
-  // ---------- stage Q tile + zero the accumulators -------------------------
+  extern __shared__ float smem[];
+  float* s_q = smem;                        // [BR*H]      staged query tile
+  float* s_k = s_q + BR * H;                // [BC*HS]     padded staged key tile
+  float* s_v = s_k + BC * HS;               // [BC*HS]     padded staged value tile
+  float* s_p = s_v + BC * HS;               // [BR*src_seq] per-row scores
+  float* s_acc = s_p + BR * src_seq;        // [BR*H]      output accumulator
+
+  // Causal pruning (C): no source beyond the largest diagonal in this block
+  // (t0+BR-1) can be attended, so skip those tiles entirely.
+  const int s_limit = is_causal ? min(src_seq, t0 + BR) : src_seq;
+  const bool use_vec = (H % kVecW<T>() == 0);
+
+  // ---------- stage Q tile + init scores to -inf ----------------------------
   {
     const int rows_valid_q = min(BR, tgt_seq - t0);
     for (int i = tid; i < BR * H; i += THREADS) {
@@ -241,83 +251,90 @@ __global__ void flash_attn_kernel(
                    ? CudaTypeTraits<T>::to_float(q[((long long)(b * tgt_seq + t0 + r) * q_heads + qh) * H + d])
                    : 0.0f;
     }
+    for (int i = tid; i < BR * src_seq; i += THREADS) s_p[i] = -INFINITY;
     for (int i = tid; i < BR * H; i += THREADS) s_acc[i] = 0.0f;
     __syncthreads();
   }
 
   float m = -INFINITY;   // running max of scores for this row
-  float l = 0.0f;        // running softmax denominator for this row
 
-  // Causal pruning (C): no source beyond the largest diagonal in this block
-  // (t0+BR-1) can be attended, so skip those tiles entirely.
-  const int s_limit = is_causal ? min(src_seq, t0 + BR) : src_seq;
-  const bool use_vec = (H % kVecW<T>() == 0);
-
+  // ---------- Pass 1: compute per-source scores (FMA dot * scale) -----------
   for (int s0 = 0; s0 < s_limit; s0 += BC) {
-    // ---------- stage K/V tile for source range [s0, s0+BC) ----------
     const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
-    const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const bool full = (s0 + BC <= src_seq);
     const int rows_valid = min(BC, src_seq - s0);
-    if (full && use_vec) {
-      KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
-      KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
-    } else {
-      stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
-      stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
-    }
-    __syncthreads();                       // K/V tile ready for all warps
+    if (full && use_vec) KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
+    else                 stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    __syncthreads();                       // K tile ready for all warps
 
     if (row_valid) {
       const int j = s0 + lane;             // global source index
       const bool masked = (j >= src_seq) || (is_causal && j > t);
-
-      // ---- dot phase: this lane owns source j ------------------------------
       float dot = -INFINITY;
       if (!masked) {
         const float* qrow = s_q + warp * H;
         const float* krow = s_k + lane * HS;
-        // Non-FMA fp32 dot: each product is rounded before the add, matching the
-        // reference's rounding under the tight fp32 tolerance (a fused FMA keeps
-        // the product unrounded and drifts off it).
         float acc = 0.0f;
 #pragma unroll 4
-        for (int d = 0; d < H; d++) acc = __fadd_rn(acc, __fmul_rn(qrow[d], krow[d]));
-        dot = __fmul_rn(acc, scale);
+        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
+        dot = acc * scale;
       }
-
-      // ---- online softmax, warp-local reduction ----------------------------
-      const float m_tile = warp_reduce_max_bcast(dot);
-      if (m_tile != -INFINITY) {           // skip fully-masked tiles
-        const float m_new = fmaxf(m, m_tile);
-        const float p = masked ? 0.0f : expf(dot - m_new);
-        const float l_tile = warp_reduce_sum_bcast(p);
-        const float corr = expf(m - m_new);   // rescale old accumulator
-
-        s_p[warp * BC + lane] = p;
-        __syncwarp();                        // publish p within this warp
-
-        // ---- accum phase: this lane owns output column d -------------------
-        for (int d = lane; d < H; d += BC) {
-          float a = 0.0f;                     // non-FMA fp32 output sum, rounding parity
-          for (int si = 0; si < BC; si++)
-            a = __fadd_rn(a, __fmul_rn(s_p[warp * BC + si], s_v[si * HS + d]));
-          s_acc[warp * H + d] = __fadd_rn(__fmul_rn(s_acc[warp * H + d], corr), a);
-        }
-
-        m = m_new;
-        l = l * corr + l_tile;
-      }
+      if (j < src_seq) s_p[warp * src_seq + j] = dot;   // masked -> -inf -> p = 0
+      m = fmaxf(m, warp_reduce_max_bcast(dot));
     }
-    __syncthreads();                       // tile state free before next staging
+    __syncthreads();                       // scores published before next tile
   }
 
-  // ---------- normalize and write the output row ----------------------------
+  // ---------- Pass 2: softmax + output ---------------------------------------
+  // l = sum_s expf(score - m) in sequential source order, then normalize each p
+  // to p/l. Summing the positive weights in order keeps the result reproducible
+  // to fp32 rounding (a tree/shuffle reduction would leave 1-ulp differences).
   if (row_valid) {
+    float l = 0.0f;
+    for (int s = 0; s < s_limit; s++) {
+      const float sc = s_p[warp * src_seq + s];
+      if (sc != -INFINITY) {
+        const float p = expf(sc - m);
+        l += p;
+        s_p[warp * src_seq + s] = p;       // overwrite score with p (unnormalized)
+      } else {
+        s_p[warp * src_seq + s] = 0.0f;    // masked -> p = 0
+      }
+    }
     const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int s = lane; s < s_limit; s += BC) s_p[warp * src_seq + s] *= inv_l;
+  }
+  __syncthreads();                         // all warps' probs normalized
+
+  // o[d] = sum_s (p[s]/l) * v[s][d], FMA accumulation (fuse the multiply+add so
+  // each term has a single rounding); V is re-staged per source tile (block-wide
+  // staging).
+  for (int s0 = 0; s0 < s_limit; s0 += BC) {
+    const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+    const bool full = (s0 + BC <= src_seq);
+    const int rows_valid = min(BC, src_seq - s0);
+    if (full && use_vec) KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
+    else                 stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    __syncthreads();
+
+    if (row_valid) {
+      for (int d = lane; d < H; d += BC) {
+        float a = 0.0f;
+        for (int si = 0; si < BC; si++) {
+          const int s = s0 + si;
+          if (s >= src_seq) break;
+          a = fmaf(s_p[warp * src_seq + s], s_v[si * HS + d], a);
+        }
+        s_acc[warp * H + d] += a;
+      }
+    }
+    __syncthreads();                       // V tile state free before next staging
+  }
+
+  if (row_valid) {
     for (int d = lane; d < H; d += BC)
       o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
-          CudaTypeTraits<T>::from_float(s_acc[warp * H + d] * inv_l);
+          CudaTypeTraits<T>::from_float(s_acc[warp * H + d]);
   }
 }
 
@@ -371,19 +388,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   constexpr int BR = 8, BC = 32;
   const int HS = head_dim + 1;   // padded shared row stride
-  // SDPA default scaling; computed in double then rounded to float so the value
-  // matches the reference under the tight fp32 tolerance.
-  const float scale = (float)(1.0 / sqrt((double)head_dim));
   const dim3 grid((target_seq_len + BR - 1) / BR, batch_size, query_heads);
-  const size_t smem = ((size_t)BR * head_dim      // s_q
-                       + 2 * (size_t)BC * HS       // s_k + s_v (padded)
-                       + (size_t)BR * BC           // s_p
-                       + (size_t)BR * head_dim)    // s_acc
+  // s_q + 2*BC*HS (s_k, s_v) + BR*src_seq (s_p scores) + BR*head_dim (s_acc).
+  const size_t smem = ((size_t)BR * head_dim
+                       + 2 * (size_t)BC * HS
+                       + (size_t)BR * src_seq_len
+                       + (size_t)BR * head_dim)
                       * sizeof(float);
 
   flash_attn_kernel<T><<<grid, BR * BC, smem>>>(
       d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads, kv_heads,
-      head_dim, scale, is_causal);
+      head_dim, is_causal);
   RUNTIME_CHECK(mcGetLastError());
   RUNTIME_CHECK(mcDeviceSynchronize());
 
