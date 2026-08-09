@@ -277,10 +277,13 @@ __global__ void flash_attn_kernel(
       if (!masked) {
         const float* qrow = s_q + warp * H;
         const float* krow = s_k + lane * HS;
+        // Non-FMA fp32 dot: each product is rounded before the add, matching the
+        // reference's rounding under the tight fp32 tolerance (a fused FMA keeps
+        // the product unrounded and drifts off it).
         float acc = 0.0f;
 #pragma unroll 4
-        for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];
-        dot = acc * scale;
+        for (int d = 0; d < H; d++) acc = __fadd_rn(acc, __fmul_rn(qrow[d], krow[d]));
+        dot = __fmul_rn(acc, scale);
       }
 
       // ---- online softmax, warp-local reduction ----------------------------
@@ -296,10 +299,10 @@ __global__ void flash_attn_kernel(
 
         // ---- accum phase: this lane owns output column d -------------------
         for (int d = lane; d < H; d += BC) {
-          float a = 0.0f;
+          float a = 0.0f;                     // non-FMA fp32 output sum, rounding parity
           for (int si = 0; si < BC; si++)
-            a += s_p[warp * BC + si] * s_v[si * HS + d];
-          s_acc[warp * H + d] = s_acc[warp * H + d] * corr + a;
+            a = __fadd_rn(a, __fmul_rn(s_p[warp * BC + si], s_v[si * HS + d]));
+          s_acc[warp * H + d] = __fadd_rn(__fmul_rn(s_acc[warp * H + d], corr), a);
         }
 
         m = m_new;
@@ -368,7 +371,9 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   constexpr int BR = 8, BC = 32;
   const int HS = head_dim + 1;   // padded shared row stride
-  const float scale = 1.0f / sqrtf((float)head_dim);   // SDPA default scaling
+  // SDPA default scaling; computed in double then rounded to float so the value
+  // matches the reference under the tight fp32 tolerance.
+  const float scale = (float)(1.0 / sqrt((double)head_dim));
   const dim3 grid((target_seq_len + BR - 1) / BR, batch_size, query_heads);
   const size_t smem = ((size_t)BR * head_dim      // s_q
                        + 2 * (size_t)BC * HS       // s_k + s_v (padded)
