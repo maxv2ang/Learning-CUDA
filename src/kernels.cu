@@ -255,56 +255,15 @@ __global__ void flash_attn_kernel(
     __syncthreads();
   }
 
-  float m = -INFINITY;   // running max of scores for this row
-  float l = 0.0f;        // running softmax denominator for this row
-
-  // ---------- Pass 1: online softmax -> final m, l ---------------------------
-  // m and l are streamed over source tiles, so large src_seq never needs the
-  // full score list resident in shared memory.
-  for (int s0 = 0; s0 < s_limit; s0 += BC) {
-    const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
-    const bool full = (s0 + BC <= src_seq);
-    const int rows_valid = min(BC, src_seq - s0);
-    if (full && use_vec) KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
-    else                 stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
-    __syncthreads();                       // K tile ready for all warps
-
-    if (row_valid) {
-      const int j = s0 + lane;             // global source index
-      const bool masked = (j >= src_seq) || (is_causal && j > t);
-      float dot = -INFINITY;
-      if (!masked) {
-        const float* qrow = s_q + warp * H;
-        const float* krow = s_k + lane * HS;
-        float acc = 0.0f;
-#pragma unroll 4
-        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
-        dot = acc * scale;
-      }
-      const float m_tile = warp_reduce_max_bcast(dot);
-      if (m_tile != -INFINITY) {           // skip fully-masked tiles
-        const float m_new = fmaxf(m, m_tile);
-        const float p = masked ? 0.0f : expf(dot - m_new);
-        const float l_tile = warp_reduce_sum_bcast(p);
-        const float corr = expf(m - m_new);
-        m = m_new;
-        l = l * corr + l_tile;
-      }
-    }
-    __syncthreads();                       // K tile state free before next staging
-  }
-
-  // ---------- Pass 2: o[d] = sum_s (p[s]/l) * v[s][d] ------------------------
-  // Uses the final m, l from pass 1. Each p is normalized by 1/l before the V
-  // accumulation and accumulated with FMA (a single rounding per term). K/V are
-  // re-staged here to recompute the scores; staging and block sync stay outside
-  // the per-row branch so all threads take them.
-  const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
-  for (int s0 = 0; s0 < s_limit; s0 += BC) {
-    const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
-    const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
-    const bool full = (s0 + BC <= src_seq);
-    const int rows_valid = min(BC, src_seq - s0);
+  if (src_seq <= BC) {
+    // ---------- single-tile fast path ----------------------------------------
+    // Stage K/V once and softmax+output directly. Bit-identical to the two-pass
+    // path (same m, l, p/l, FMA sum) but avoids the second K read + dot
+    // recompute for small src_seq.
+    const T* ksrc = k + (((long long)b * src_seq + 0) * kv_heads + kvh) * H;
+    const T* vsrc = v + (((long long)b * src_seq + 0) * kv_heads + kvh) * H;
+    const bool full = (BC <= src_seq);
+    const int rows_valid = min(BC, src_seq);
     if (full && use_vec) {
       KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
       KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
@@ -315,7 +274,7 @@ __global__ void flash_attn_kernel(
     __syncthreads();                       // K/V tile ready for all warps
 
     if (row_valid) {
-      const int j = s0 + lane;
+      const int j = lane;                  // global source index == lane
       const bool masked = (j >= src_seq) || (is_causal && j > t);
       float dot = -INFINITY;
       if (!masked) {
@@ -323,27 +282,119 @@ __global__ void flash_attn_kernel(
         const float* krow = s_k + lane * HS;
         float acc = 0.0f;
 #pragma unroll 4
-        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);
+        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
         dot = acc * scale;
       }
-      const float p = masked ? 0.0f : expf(dot - m);
-      s_p[warp * BC + lane] = p * inv_l;   // (p/l)
-      __syncwarp();                        // publish normalized p within this warp
-
-      for (int d = lane; d < H; d += BC) {
-        float a = 0.0f;
-        for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
-        s_acc[warp * H + d] += a;
+      const float m = warp_reduce_max_bcast(dot);
+      if (m != -INFINITY) {                // skip fully-masked rows
+        const float p = masked ? 0.0f : expf(dot - m);
+        const float l = warp_reduce_sum_bcast(p);
+        const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        s_p[warp * BC + lane] = p * inv_l;
+        __syncwarp();                      // publish (p/l) within this warp
+        for (int d = lane; d < H; d += BC) {
+          float a = 0.0f;
+          for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
+          o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
+              CudaTypeTraits<T>::from_float(a);
+        }
+      } else {
+        for (int d = lane; d < H; d += BC)
+          o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
+              CudaTypeTraits<T>::from_float(0.0f);
       }
     }
-    __syncthreads();                       // K/V tile state free before next staging
-  }
-
-  if (row_valid) {
-    for (int d = lane; d < H; d += BC)
-      o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
-          CudaTypeTraits<T>::from_float(s_acc[warp * H + d]);
-  }
+  } else {
+    float m = -INFINITY;   // running max of scores for this row
+    float l = 0.0f;        // running softmax denominator for this row
+  
+    // ---------- Pass 1: online softmax -> final m, l ---------------------------
+    // m and l are streamed over source tiles, so large src_seq never needs the
+    // full score list resident in shared memory.
+    for (int s0 = 0; s0 < s_limit; s0 += BC) {
+      const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+      const bool full = (s0 + BC <= src_seq);
+      const int rows_valid = min(BC, src_seq - s0);
+      if (full && use_vec) KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
+      else                 stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+      __syncthreads();                       // K tile ready for all warps
+  
+      if (row_valid) {
+        const int j = s0 + lane;             // global source index
+        const bool masked = (j >= src_seq) || (is_causal && j > t);
+        float dot = -INFINITY;
+        if (!masked) {
+          const float* qrow = s_q + warp * H;
+          const float* krow = s_k + lane * HS;
+          float acc = 0.0f;
+  #pragma unroll 4
+          for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
+          dot = acc * scale;
+        }
+        const float m_tile = warp_reduce_max_bcast(dot);
+        if (m_tile != -INFINITY) {           // skip fully-masked tiles
+          const float m_new = fmaxf(m, m_tile);
+          const float p = masked ? 0.0f : expf(dot - m_new);
+          const float l_tile = warp_reduce_sum_bcast(p);
+          const float corr = expf(m - m_new);
+          m = m_new;
+          l = l * corr + l_tile;
+        }
+      }
+      __syncthreads();                       // K tile state free before next staging
+    }
+  
+    // ---------- Pass 2: o[d] = sum_s (p[s]/l) * v[s][d] ------------------------
+    // Uses the final m, l from pass 1. Each p is normalized by 1/l before the V
+    // accumulation and accumulated with FMA (a single rounding per term). K/V are
+    // re-staged here to recompute the scores; staging and block sync stay outside
+    // the per-row branch so all threads take them.
+    const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int s0 = 0; s0 < s_limit; s0 += BC) {
+      const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+      const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
+      const bool full = (s0 + BC <= src_seq);
+      const int rows_valid = min(BC, src_seq - s0);
+      if (full && use_vec) {
+        KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
+        KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
+      } else {
+        stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+        stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+      }
+      __syncthreads();                       // K/V tile ready for all warps
+  
+      if (row_valid) {
+        const int j = s0 + lane;
+        const bool masked = (j >= src_seq) || (is_causal && j > t);
+        float dot = -INFINITY;
+        if (!masked) {
+          const float* qrow = s_q + warp * H;
+          const float* krow = s_k + lane * HS;
+          float acc = 0.0f;
+  #pragma unroll 4
+          for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);
+          dot = acc * scale;
+        }
+        const float p = masked ? 0.0f : expf(dot - m);
+        s_p[warp * BC + lane] = p * inv_l;   // (p/l)
+        __syncwarp();                        // publish normalized p within this warp
+  
+        for (int d = lane; d < H; d += BC) {
+          float a = 0.0f;
+          for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
+          s_acc[warp * H + d] += a;
+        }
+      }
+      __syncthreads();                       // K/V tile state free before next staging
+    }
+  
+    if (row_valid) {
+      for (int d = lane; d < H; d += BC)
+        o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
+            CudaTypeTraits<T>::from_float(s_acc[warp * H + d]);
+    }
+  }   // end multi-tile two-pass path (else)
 }
 
 // ============================================================================
