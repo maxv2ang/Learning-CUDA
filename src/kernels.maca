@@ -234,15 +234,15 @@ __global__ void flash_attn_kernel(
   float* s_q = smem;                        // [BR*H]      staged query tile
   float* s_k = s_q + BR * H;                // [BC*HS]     padded staged key tile
   float* s_v = s_k + BC * HS;               // [BC*HS]     padded staged value tile
-  float* s_p = s_v + BC * HS;               // [BR*src_seq] per-row scores
-  float* s_acc = s_p + BR * src_seq;        // [BR*H]      output accumulator
+  float* s_p = s_v + BC * HS;               // [BR*BC]     per-tile normalized probs
+  float* s_acc = s_p + BR * BC;             // [BR*H]      output accumulator
 
   // Causal pruning (C): no source beyond the largest diagonal in this block
   // (t0+BR-1) can be attended, so skip those tiles entirely.
   const int s_limit = is_causal ? min(src_seq, t0 + BR) : src_seq;
   const bool use_vec = (H % kVecW<T>() == 0);
 
-  // ---------- stage Q tile + init scores to -inf ----------------------------
+  // ---------- stage Q tile + zero the output accumulator ---------------------
   {
     const int rows_valid_q = min(BR, tgt_seq - t0);
     for (int i = tid; i < BR * H; i += THREADS) {
@@ -251,14 +251,16 @@ __global__ void flash_attn_kernel(
                    ? CudaTypeTraits<T>::to_float(q[((long long)(b * tgt_seq + t0 + r) * q_heads + qh) * H + d])
                    : 0.0f;
     }
-    for (int i = tid; i < BR * src_seq; i += THREADS) s_p[i] = -INFINITY;
     for (int i = tid; i < BR * H; i += THREADS) s_acc[i] = 0.0f;
     __syncthreads();
   }
 
   float m = -INFINITY;   // running max of scores for this row
+  float l = 0.0f;        // running softmax denominator for this row
 
-  // ---------- Pass 1: compute per-source scores (FMA dot * scale) -----------
+  // ---------- Pass 1: online softmax -> final m, l ---------------------------
+  // m and l are streamed over source tiles, so large src_seq never needs the
+  // full score list resident in shared memory.
   for (int s0 = 0; s0 < s_limit; s0 += BC) {
     const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const bool full = (s0 + BC <= src_seq);
@@ -279,56 +281,62 @@ __global__ void flash_attn_kernel(
         for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
         dot = acc * scale;
       }
-      if (j < src_seq) s_p[warp * src_seq + j] = dot;   // masked -> -inf -> p = 0
-      m = fmaxf(m, warp_reduce_max_bcast(dot));
-    }
-    __syncthreads();                       // scores published before next tile
-  }
-
-  // ---------- Pass 2: softmax + output ---------------------------------------
-  // l = sum_s expf(score - m) in sequential source order, then normalize each p
-  // to p/l. Summing the positive weights in order keeps the result reproducible
-  // to fp32 rounding (a tree/shuffle reduction would leave 1-ulp differences).
-  if (row_valid) {
-    float l = 0.0f;
-    for (int s = 0; s < s_limit; s++) {
-      const float sc = s_p[warp * src_seq + s];
-      if (sc != -INFINITY) {
-        const float p = expf(sc - m);
-        l += p;
-        s_p[warp * src_seq + s] = p;       // overwrite score with p (unnormalized)
-      } else {
-        s_p[warp * src_seq + s] = 0.0f;    // masked -> p = 0
+      const float m_tile = warp_reduce_max_bcast(dot);
+      if (m_tile != -INFINITY) {           // skip fully-masked tiles
+        const float m_new = fmaxf(m, m_tile);
+        const float p = masked ? 0.0f : expf(dot - m_new);
+        const float l_tile = warp_reduce_sum_bcast(p);
+        const float corr = expf(m - m_new);
+        m = m_new;
+        l = l * corr + l_tile;
       }
     }
-    const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    for (int s = lane; s < s_limit; s += BC) s_p[warp * src_seq + s] *= inv_l;
+    __syncthreads();                       // K tile state free before next staging
   }
-  __syncthreads();                         // all warps' probs normalized
 
-  // o[d] = sum_s (p[s]/l) * v[s][d], FMA accumulation (fuse the multiply+add so
-  // each term has a single rounding); V is re-staged per source tile (block-wide
-  // staging).
+  // ---------- Pass 2: o[d] = sum_s (p[s]/l) * v[s][d] ------------------------
+  // Uses the final m, l from pass 1. Each p is normalized by 1/l before the V
+  // accumulation and accumulated with FMA (a single rounding per term). K/V are
+  // re-staged here to recompute the scores; staging and block sync stay outside
+  // the per-row branch so all threads take them.
+  const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
   for (int s0 = 0; s0 < s_limit; s0 += BC) {
+    const T* ksrc = k + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const T* vsrc = v + (((long long)b * src_seq + s0) * kv_heads + kvh) * H;
     const bool full = (s0 + BC <= src_seq);
     const int rows_valid = min(BC, src_seq - s0);
-    if (full && use_vec) KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
-    else                 stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
-    __syncthreads();
+    if (full && use_vec) {
+      KVStageVec<T>::run(ksrc, s_k, H, HS, BC, kv_heads, tid, THREADS);
+      KVStageVec<T>::run(vsrc, s_v, H, HS, BC, kv_heads, tid, THREADS);
+    } else {
+      stage_scalar<T>(ksrc, s_k, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+      stage_scalar<T>(vsrc, s_v, H, HS, BC, rows_valid, kv_heads, tid, THREADS);
+    }
+    __syncthreads();                       // K/V tile ready for all warps
 
     if (row_valid) {
+      const int j = s0 + lane;
+      const bool masked = (j >= src_seq) || (is_causal && j > t);
+      float dot = -INFINITY;
+      if (!masked) {
+        const float* qrow = s_q + warp * H;
+        const float* krow = s_k + lane * HS;
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);
+        dot = acc * scale;
+      }
+      const float p = masked ? 0.0f : expf(dot - m);
+      s_p[warp * BC + lane] = p * inv_l;   // (p/l)
+      __syncwarp();                        // publish normalized p within this warp
+
       for (int d = lane; d < H; d += BC) {
         float a = 0.0f;
-        for (int si = 0; si < BC; si++) {
-          const int s = s0 + si;
-          if (s >= src_seq) break;
-          a = fmaf(s_p[warp * src_seq + s], s_v[si * HS + d], a);
-        }
+        for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
         s_acc[warp * H + d] += a;
       }
     }
-    __syncthreads();                       // V tile state free before next staging
+    __syncthreads();                       // K/V tile state free before next staging
   }
 
   if (row_valid) {
@@ -389,10 +397,10 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   constexpr int BR = 8, BC = 32;
   const int HS = head_dim + 1;   // padded shared row stride
   const dim3 grid((target_seq_len + BR - 1) / BR, batch_size, query_heads);
-  // s_q + 2*BC*HS (s_k, s_v) + BR*src_seq (s_p scores) + BR*head_dim (s_acc).
+  // s_q + 2*BC*HS (s_k, s_v) + BR*BC (s_p) + BR*head_dim (s_acc).
   const size_t smem = ((size_t)BR * head_dim
                        + 2 * (size_t)BC * HS
-                       + (size_t)BR * src_seq_len
+                       + (size_t)BR * BC
                        + (size_t)BR * head_dim)
                       * sizeof(float);
 
