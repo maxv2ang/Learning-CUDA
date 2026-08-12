@@ -34,13 +34,13 @@ template <> __host__ __device__ constexpr int kVecW<half>()  { return 8; }
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float warp_reduce_max_bcast(float v) {
   for (int off = 16; off > 0; off >>= 1)
-    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
-  return __shfl_sync(0xffffffffu, v, 0);   // broadcast lane-0 result
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+  return v;
 }
 __device__ __forceinline__ float warp_reduce_sum_bcast(float v) {
   for (int off = 16; off > 0; off >>= 1)
-    v += __shfl_down_sync(0xffffffffu, v, off);
-  return __shfl_sync(0xffffffffu, v, 0);
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  return v;
 }
 // Block reduction helpers (blockDim.x <= 1024), used by rmsNorm.
 __device__ __forceinline__ float warp_reduce_max(float v) {
