@@ -282,7 +282,7 @@ __global__ void flash_attn_kernel(
         const float* krow = s_k + lane * HS;
         float acc = 0.0f;
 #pragma unroll 4
-        for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
+        for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];  // dot
         dot = acc * scale;
       }
       const float m = warp_reduce_max_bcast(dot);
@@ -294,7 +294,7 @@ __global__ void flash_attn_kernel(
         __syncwarp();                      // publish (p/l) within this warp
         for (int d = lane; d < H; d += BC) {
           float a = 0.0f;
-          for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
+          for (int si = 0; si < BC; si++) a += s_p[warp * BC + si] * s_v[si * HS + d];
           o[((long long)(b * tgt_seq + t) * q_heads + qh) * H + d] =
               CudaTypeTraits<T>::from_float(a);
         }
@@ -328,7 +328,7 @@ __global__ void flash_attn_kernel(
           const float* krow = s_k + lane * HS;
           float acc = 0.0f;
   #pragma unroll 4
-          for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);  // FMA dot
+          for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];  // dot
           dot = acc * scale;
         }
         const float m_tile = warp_reduce_max_bcast(dot);
@@ -373,7 +373,7 @@ __global__ void flash_attn_kernel(
           const float* krow = s_k + lane * HS;
           float acc = 0.0f;
   #pragma unroll 4
-          for (int d = 0; d < H; d++) acc = fmaf(qrow[d], krow[d], acc);
+          for (int d = 0; d < H; d++) acc += qrow[d] * krow[d];
           dot = acc * scale;
         }
         const float p = masked ? 0.0f : expf(dot - m);
@@ -382,7 +382,7 @@ __global__ void flash_attn_kernel(
   
         for (int d = lane; d < H; d += BC) {
           float a = 0.0f;
-          for (int si = 0; si < BC; si++) a = fmaf(s_p[warp * BC + si], s_v[si * HS + d], a);
+          for (int si = 0; si < BC; si++) a += s_p[warp * BC + si] * s_v[si * HS + d];
           s_acc[warp * H + d] += a;
         }
       }
